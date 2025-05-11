@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 编辑器和IDE
+.idea/
+.vscode/
+.cursor/
+cursor/
+*.swp
+*.swo
+.DS_Store
+
+# 运行时生成的文件
+runs/
+.ipynb_checkpoints/
+
+# 大型文件
+*.pdf
+
+# 数据集文件（如需要可以取消注释）
+database/
+# 保留数据集的yaml文件
+!data/*/data.yaml
+
+# 其他
+.env
+.venv
+env/
+venv/
+ENV/ 

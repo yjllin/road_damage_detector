@@ -1,0 +1,49 @@
+# YOLOv8s改进模型配置
+model:
+  name: improved_yolov8s
+  backbone: C2f-Faster-EMA  # 带EMA注意力机制的C2f-Faster骨干网络
+  neck: FPN-PAN             # 特征金字塔网络(FPN) + 路径聚合网络(PAN)
+  head: Detect-Dyhead       # 动态检测头，具有尺度、空间和任务感知注意力
+  input_size: [640, 640]    # 输入尺寸
+  activation: ReLU          # 使用ReLU为SimSPPF模块（提高速度）
+
+training:
+  batch_size: 16            # 根据可用GPU内存调整
+  epochs: 200
+  optimizer: SGD
+  lr: 0.01                  # 学习率
+  momentum: 0.937
+  weight_decay: 5e-4
+  scheduler: StepLR
+  gamma: 0.1
+  steps: [100, 150]
+  
+loss:
+  bbox_loss: CIoU           # 使用完整交并比(CIoU)损失进行边界框回归
+  cls_loss: CrossEntropy    # 使用交叉熵损失进行分类
+
+data_augmentation:
+  resize: [640, 640]        # 调整图像尺寸以匹配YOLOv8s输入要求
+  augmentations:
+    flip: horizontal
+    rotate: 10
+    brightness: 0.2
+    contrast: 0.2
+    hsv_h: 0.015           # HSV色调增强
+    hsv_s: 0.7             # HSV饱和度增强
+    hsv_v: 0.4             # HSV亮度增强
+    degrees: 0.5           # 旋转角度 (+/- deg)
+    translate: 0.1         # 平移 (+/- fraction)
+    scale: 0.6             # 缩放 (+/- gain)
+    shear: 0.2             # 剪切 (+/- deg)
+    flipud: 0.1            # 上下翻转概率
+    fliplr: 0.5            # 左右翻转概率
+    mosaic: 1.0            # mosaic数据增强概率
+    mixup: 0.2             # mixup数据增强概率
+
+post_processing:
+  confidence_threshold: 0.5  # 置信度阈值
+  nms_threshold: 0.4         # 非极大值抑制阈值
+
+classes:
+  names: ['D00', 'D10', 'D20', 'D40', 'Repair', 'Block Crack']  # RDD2022数据集中的缺陷类型
