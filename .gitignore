@@ -38,8 +38,8 @@ runs/
 
 # 数据集文件（如需要可以取消注释）
 database/
-# 保留数据集的yaml文件
-!data/*/data.yaml
+# 保留China_MotorBike数据
+!database/China_MotorBike
 
 # 其他
 .env

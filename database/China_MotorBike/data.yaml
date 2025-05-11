@@ -1,0 +1,23 @@
+path: ./database/China_MotorBike/yolo  # 数据集根目录
+train: ./train/images  # 训练图像相对路径
+val: True  # 是否使用验证集
+val_images: ./val/images  # 验证图像相对路径
+test: True  # 是否使用测试集
+test_images: ./test/images  # 测试图像相对路径
+
+# # 类别
+# '''
+# 'D00': 0,  # 纵向裂缝(Longitudinal Cracks)
+# 'D10': 1,  # 横向裂缝(Transverse Cracks)
+# 'D20': 2,  # 鳄鱼裂缝(Alligator Cracks)
+# 'D40': 3,  # 坑洞(Potholes)
+# 'Repair': 4,  # 修补(Repair)
+# 'Block Crack': 5  # 块状裂缝(Block Crack)
+# '''
+nc:   6  # 类别数量
+names: ['Longitudinal Cracks', 'Transverse Cracks', 'Alligator Cracks', 'Potholes', 'Repair', 'Block Crack']  # 类别名称
+
+# 数据集配置
+channels: 3  # 图像通道数
+width: 640   # 图像宽度
+height: 640  # 图像高度
