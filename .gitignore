@@ -37,9 +37,13 @@ runs/
 *.pdf
 
 # 数据集文件（如需要可以取消注释）
-database/
-# 保留China_MotorBike数据
-!database/China_MotorBike
+database/China_Drone
+# database/China_MotorBike
+database/China_MotorBike_small
+database/Japan
+database/Norway
+database/United_States
+
 
 # 其他
 .env

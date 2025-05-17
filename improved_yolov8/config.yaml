@@ -8,7 +8,7 @@ model:
   activation: ReLU          # 使用ReLU为SimSPPF模块（提高速度）
 
 training:
-  batch_size: 16            # 根据可用GPU内存调整
+  batch_size: 4            # 从16减小到4，防止OOM
   epochs: 200
   optimizer: SGD
   lr: 0.01                  # 学习率
@@ -46,4 +46,4 @@ post_processing:
   nms_threshold: 0.4         # 非极大值抑制阈值
 
 classes:
-  names: ['D00', 'D10', 'D20', 'D40', 'Repair', 'Block Crack']  # RDD2022数据集中的缺陷类型
+  names: ['Longitudinal Cracks', 'Transverse Cracks', 'Alligator Cracks', 'Potholes', 'Repair', 'Block Crack']  # RDD2022数据集中的缺陷类型
