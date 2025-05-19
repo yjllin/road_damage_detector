@@ -3,6 +3,7 @@ import shutil
 import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from PIL import Image
 
 def convert_xml_to_yolo(xml_file, image_width, image_height, class_map):
     """
@@ -60,8 +61,8 @@ def get_image_dimensions(image_path):
     # 需要安装PIL: from PIL import Image
     # img = Image.open(image_path)
     # return img.width, img.height
-    
-    return 1280, 720  # 假设默认尺寸
+    img = Image.open(image_path)
+    return img.width, img.height
 
 def split_dataset(dataset_path, train_ratio=0.8):
     """

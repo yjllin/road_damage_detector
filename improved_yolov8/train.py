@@ -217,17 +217,71 @@ def train(config):
     logger.info(f"初始化模型: 类别数={num_classes}")
     model = ImprovedYoloV8s()
     
+    # 读取原始模型配置
+    if hasattr(model, 'detect'):
+        logger.info(f"原始模型检测头: nc={model.detect.nc}, reg_max={model.detect.reg_max}, no={model.detect.no}")
+    
+    # 更新模型的类别数
+    if hasattr(model, 'detect'):
+        logger.info(f"更新模型检测头的类别数: {num_classes}")
+        if model.detect.nc != num_classes:
+            orig_nc = model.detect.nc
+            model.detect.nc = num_classes
+            model.detect.no = num_classes + 4 * model.detect.reg_max
+            logger.info(f"已更新检测头参数: nc={model.detect.nc} (原{orig_nc}), reg_max={model.detect.reg_max}, no={model.detect.no}")
+    
+    # 读取模型的当前配置
+    if hasattr(model, 'args'):
+        current_args = model.args.__dict__ if hasattr(model.args, '__dict__') else model.args
+        logger.info(f"模型当前参数: {current_args}")
+    
     # 更新模型参数，使用update而不是覆盖
     if hasattr(model, 'args'):
         if isinstance(model.args, dict):
+            # 确保更新前保存reg_max
+            reg_max_original = model.detect.reg_max if hasattr(model, 'detect') else model.args.get('reg_max', 16)
+            
             model.args.update(model_config)
+            
+            # 确保reg_max没有被错误修改
+            if 'reg_max' in model.args and hasattr(model, 'detect') and model.args['reg_max'] != model.detect.reg_max:
+                logger.warning(f"reg_max不一致: args={model.args['reg_max']}, detect={model.detect.reg_max}, 以detect为准")
+                model.args['reg_max'] = model.detect.reg_max
         else:
+            # 确保更新前保存reg_max
+            reg_max_original = model.detect.reg_max if hasattr(model, 'detect') else getattr(model.args, 'reg_max', 16)
+            
             vars(model.args).update(model_config)
+            
+            # 确保reg_max没有被错误修改
+            if hasattr(model.args, 'reg_max') and hasattr(model, 'detect') and model.args.reg_max != model.detect.reg_max:
+                logger.warning(f"reg_max不一致: args={model.args.reg_max}, detect={model.detect.reg_max}, 以detect为准")
+                model.args.reg_max = model.detect.reg_max
     
     # 重新生成 model.hyp 以确保它反映了所有更新，并且是一个 SimpleNamespace
-    if hasattr(model, 'args') and isinstance(model.args, dict):
-        model.hyp = SimpleNamespace(**model.args)
+    if hasattr(model, 'args'):
+        if isinstance(model.args, dict):
+            model.hyp = SimpleNamespace(**model.args)
+        else:
+            model.hyp = SimpleNamespace(**vars(model.args))
         logger.info("已从合并的 model.args 更新 model.hyp")
+        logger.info(f"更新后的模型参数: {model.hyp.__dict__ if hasattr(model.hyp, '__dict__') else model.hyp}")
+    
+    # 检查reg_max是否正确设置，以及检测头输出维度是否正确
+    if hasattr(model, 'detect'):
+        expected_no = model.detect.nc + 4 * model.detect.reg_max
+        if model.detect.no != expected_no:
+            logger.error(f"检测头输出维度不匹配: no={model.detect.no}, 预期值={expected_no} (nc={model.detect.nc} + 4*reg_max={4*model.detect.reg_max})")
+            model.detect.no = expected_no
+            logger.info(f"已修复: 设置model.detect.no={model.detect.no}")
+    
+    # 检查reg_max是否正确设置
+    if hasattr(model, 'detect') and hasattr(model, 'hyp') and hasattr(model.hyp, 'reg_max'):
+        if model.detect.reg_max != model.hyp.reg_max:
+            logger.warning(f"reg_max不一致: model.detect.reg_max={model.detect.reg_max}, model.hyp.reg_max={model.hyp.reg_max}")
+            # 保持一致
+            model.hyp.reg_max = model.detect.reg_max
+            logger.info(f"已修复: 设置model.hyp.reg_max={model.hyp.reg_max}")
 
     # 转移模型到设备
     model = model.to(device)
@@ -244,26 +298,59 @@ def train(config):
     # 确保检测头的device设置正确
     model.model[-1].device = device
     
-    # # 添加调试日志：检查 model.hyp 的状态
-    # # logger.info(f"调试: 初始化损失函数前的 model.hyp 类型: {type(model.hyp)}")
-    # if isinstance(model.hyp, dict):
-    #     # logger.warning(f"警告: model.hyp 是一个字典。键值: {list(model.hyp.keys())}")
-    #     if 'box' not in model.hyp:
-    #         logger.error("错误: model.hyp 是字典且缺少 'box' 键。")
-    # elif hasattr(model.hyp, 'box'): # 适用于 SimpleNamespace 或其他具有属性的对象
-    #     # logger.info(f"信息: model.hyp 具有 'box' 属性，值为: {model.hyp.box}")
-    # else:
-    #     logger.warning(f"警告: model.hyp 不是字典，但缺少 'box' 属性。model.hyp 内容: {vars(model.hyp) if hasattr(model.hyp, '__dict__') else 'N/A'}")
-
     # 初始化损失函数
     try:
+        # 首先确保模型的检测头配置正确
+        if hasattr(model, 'detect'):
+            model_reg_max = model.detect.reg_max
+            logger.info(f"损失函数初始化前确认: model.detect.reg_max={model_reg_max}")
+        else:
+            model_reg_max = 16
+            logger.warning(f"model没有detect属性，使用默认reg_max={model_reg_max}")
+        
         criterion = DetectionLoss(model)
         logger.info("使用Ultralytics v8DetectionLoss")
         # 验证DyHead.no与Loss.no一致性
         assert model.detect.no == model.detect.nc + 4 * model.detect.reg_max, \
             "no mismatch: model.detect.no != nc + 4*reg_max"
+            
+        # 打印损失函数的超参数
+        if hasattr(criterion, 'hyp'):
+            hyp_dict = criterion.hyp.__dict__ if hasattr(criterion.hyp, '__dict__') else criterion.hyp
+            logger.info(f"损失函数超参数: {hyp_dict}")
+            
+            # 确保criterion.hyp.reg_max与model.detect.reg_max一致
+            if hasattr(criterion.hyp, 'reg_max') and hasattr(model, 'detect'):
+                if criterion.hyp.reg_max != model.detect.reg_max:
+                    logger.warning(f"损失函数reg_max与模型不一致: criterion.hyp.reg_max={criterion.hyp.reg_max}, model.detect.reg_max={model.detect.reg_max}")
+                    criterion.hyp.reg_max = model.detect.reg_max
+                    logger.info(f"已修复: 设置criterion.hyp.reg_max={criterion.hyp.reg_max}")
+        else:
+            logger.warning("损失函数没有hyp属性")
+            
+        # 检查其他关键部分
+        if hasattr(criterion, 'no') and hasattr(model, 'detect'):
+            if criterion.no != model.detect.no:
+                logger.warning(f"损失函数no与模型不一致: criterion.no={criterion.no}, model.detect.no={model.detect.no}")
+                criterion.no = model.detect.no
+                logger.info(f"已修复: 设置criterion.no={criterion.no}")
+                
+        if hasattr(criterion, 'nc') and hasattr(model, 'detect'):
+            if criterion.nc != model.detect.nc:
+                logger.warning(f"损失函数nc与模型不一致: criterion.nc={criterion.nc}, model.detect.nc={model.detect.nc}")
+                criterion.nc = model.detect.nc
+                logger.info(f"已修复: 设置criterion.nc={criterion.nc}")
+                
+        if hasattr(criterion, 'reg_max') and hasattr(model, 'detect'):
+            if criterion.reg_max != model.detect.reg_max:
+                logger.warning(f"损失函数reg_max与模型不一致: criterion.reg_max={criterion.reg_max}, model.detect.reg_max={model.detect.reg_max}")
+                criterion.reg_max = model.detect.reg_max
+                logger.info(f"已修复: 设置criterion.reg_max={criterion.reg_max}")
+                
     except Exception as e:
         logger.error(f"初始化损失函数失败: {e}")
+        import traceback
+        logger.error(f"错误堆栈: {traceback.format_exc()}")
         # 仅作为后备方案尝试其他损失函数
         criterion = E2EDetectLoss(model)
         logger.info("使用E2EDetectLoss作为备选损失函数")
@@ -307,9 +394,9 @@ def train(config):
     logger.info(f"使用batch_size: {batch_size}, 梯度累积: {grad_accumulation}, 逻辑批大小: {batch_size * grad_accumulation}")
     
     # 学习率预热设置
-    warmup_epochs = training_config.get('warmup_epochs', 5)
-    warmup_bias_lr = training_config.get('warmup_bias_lr', 0.1)
-    final_lr = model_config.get('lr0', 0.01)  # 预热后的目标学习率
+    warmup_epochs = training_config.get('warmup_epochs', 10)  # 增加预热轮数
+    warmup_bias_lr = training_config.get('warmup_bias_lr', 0.05)  # 降低预热学习率
+    final_lr = model_config.get('lr0', 0.005)  # 降低预热后的目标学习率
     logger.info(f"启用学习率预热: {warmup_epochs}轮, 从{initial_lr}到{final_lr}")
     
     # 创建学习率调度器
@@ -485,6 +572,23 @@ def compute_loss(predictions, current_batch, loss_criterion, hyp_dict_for_fallba
                 break
     else:
         device_for_fallback_tensors = predictions[0].device
+        
+    # 检查预测张量是否正确
+    if len(predictions) > 0 and isinstance(predictions[0], torch.Tensor):
+        first_pred = predictions[0]
+        # 检查是否有NaN值
+        if torch.isnan(first_pred).any():
+            logger.warning(f"预测张量包含NaN值!")
+        else:
+            # 打印一些基本信息
+            pred_stats = {
+                "形状": [p.shape for p in predictions],
+                "均值": [p.mean().item() for p in predictions],
+                "标准差": [p.std().item() for p in predictions],
+                "最小值": [p.min().item() for p in predictions],
+                "最大值": [p.max().item() for p in predictions]
+            }
+            # logger.info(f"预测统计信息: {pred_stats}")
 
     try:
         # === 调试和修复 loss_criterion.hyp ===
@@ -494,19 +598,19 @@ def compute_loss(predictions, current_batch, loss_criterion, hyp_dict_for_fallba
             # 确保 hyp_dict_for_fallback 首先是 SimpleNamespace (如果它是字典)
             if isinstance(hyp_dict_for_fallback, dict):
                 hyp_dict_for_fallback = SimpleNamespace(**hyp_dict_for_fallback)
-                logger.info("compute_loss: hyp_dict_for_fallback (原为dict) 已转换为 SimpleNamespace")
+                # logger.info("compute_loss: hyp_dict_for_fallback (原为dict) 已转换为 SimpleNamespace")
 
             required_keys = ['box', 'cls', 'dfl', 'label_smoothing', 'fl_gamma', 'reg_max'] # 根据 DetectionLoss 的需要添加, reg_max 也需要
             if all(hasattr(hyp_dict_for_fallback, key) for key in required_keys):
                 loss_criterion.hyp = hyp_dict_for_fallback # 直接使用转换后的 SimpleNamespace
-                logger.info("compute_loss: 已从 hyp_dict_for_fallback (现为SimpleNamespace) 赋值给 loss_criterion.hyp")
+                # logger.info("compute_loss: 已从 hyp_dict_for_fallback (现为SimpleNamespace) 赋值给 loss_criterion.hyp")
             elif hasattr(loss_criterion, 'model') and hasattr(loss_criterion.model, 'hyp') and isinstance(loss_criterion.model.hyp, SimpleNamespace):
                 logger.warning("compute_loss: hyp_dict_for_fallback 不完整，尝试从 loss_criterion.model.hyp 恢复 (如果它是 SimpleNamespace)")
                 loss_criterion.hyp = loss_criterion.model.hyp
-                logger.info("compute_loss: 已从 loss_criterion.model.hyp 恢复 loss_criterion.hyp")
+                # logger.info("compute_loss: 已从 loss_criterion.model.hyp 恢复 loss_criterion.hyp")
             else:
                 default_hyp_values = {
-                    'box': 7.5, 'cls': 0.5, 'dfl': 1.5, 'label_smoothing': 0.0, 'fl_gamma': 0.0, 'reg_max': 15 # fault.txt 要求 reg_max 为 15
+                    'box': 7.5, 'cls': 0.5, 'dfl': 1.5, 'label_smoothing': 0.0, 'fl_gamma': 0.0, 'reg_max': 16 # 修改reg_max为16而不是15
                 }
                 loss_criterion.hyp = SimpleNamespace(**default_hyp_values)
                 logger.warning(f"compute_loss: 已创建包含默认值的最小 loss_criterion.hyp: {loss_criterion.hyp}")
@@ -518,12 +622,18 @@ def compute_loss(predictions, current_batch, loss_criterion, hyp_dict_for_fallba
                 logger.error(f"compute_loss: 无法将 loss_criterion.hyp ({type(loss_criterion.hyp)}) 转换为 SimpleNamespace。保持原样。")
 
         # 再次检查并记录类型，确保修复生效
-        if not isinstance(loss_criterion.hyp, SimpleNamespace):
-            logger.error(f"compute_loss: 修复后 loss_criterion.hyp 仍然不是 SimpleNamespace，类型: {type(loss_criterion.hyp)}. 这可能会导致错误。")
+        # if not isinstance(loss_criterion.hyp, SimpleNamespace):
+        #     logger.error(f"compute_loss: 修复后 loss_criterion.hyp 仍然不是 SimpleNamespace，类型: {type(loss_criterion.hyp)}. 这可能会导致错误。")
         # === 调试和修复结束 ===
 
-        # 直接传递预测列表给损失函数
-        loss, loss_items = loss_criterion(predictions, current_batch)
+        # 检查当前批次的标签数据
+        if 'cls' in current_batch and 'bboxes' in current_batch:
+            cls = current_batch['cls']
+            bboxes = current_batch['bboxes']
+            
+            if len(cls) > 0:
+                        # 直接传递预测列表给损失函数
+                loss, loss_items = loss_criterion(predictions, current_batch)
         
         # 数值稳定性检查 - 使用any()检查多元素张量
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -565,8 +675,9 @@ def validate(model, dataloader, hyp, device):
     支持 DyHead (anchor-free, DFL) 输出，返回常用检测指标字典。
     """
     model.eval()
-    conf_thres = hyp.get("conf_thres", 0.25)
-    iou_thres  = hyp.get("iou_thres", 0.7)
+    # 降低置信度阈值以获取更多候选框
+    conf_thres = hyp.get("conf_thres", 0.01)  # 从0.25降低到0.01
+    iou_thres  = hyp.get("iou_thres", 0.45)   # 从0.7降低到0.45，与YOLOv8默认值一致
     max_det    = hyp.get("max_det",   300)
 
     # 初始化度量器
@@ -578,7 +689,7 @@ def validate(model, dataloader, hyp, device):
     proj = torch.arange(model.detect.reg_max, device=device).float()          # DFL 投影向量
     stride = model.stride.to(device)                                          # [8,16,32]
 
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         imgs = batch["img"].to(device, non_blocking=True).float() / 255.      # [B,C,H,W]
         bs   = imgs.size(0)
 
@@ -612,37 +723,72 @@ def validate(model, dataloader, hyp, device):
                                     torch.arange(nx, device=device), indexing="ij")
             grid = torch.stack((xv, yv), 0).float()      # [2,ny,nx]
 
-            # 中心点 + 左上偏移，转 xyxy
-            xy  = (grid + 0.5).unsqueeze(0) * stride[level]          # [1,2,ny,nx]
-            lrtb = distances * stride[level]                         # [bs,4,ny,nx]
+            # 安全性检查
+            if torch.isnan(distances).any() or torch.isinf(distances).any():
+                logger.warning(f"检测到NaN/Inf距离值! 级别{level}")
+                distances = torch.clamp(distances, 0, 100)  # 应对NaN/Inf
 
-            x1 = xy[:,0] - lrtb[:,0]
-            y1 = xy[:,1] - lrtb[:,2]
-            x2 = xy[:,0] + lrtb[:,1]
-            y2 = xy[:,1] + lrtb[:,3]
-            boxes = torch.stack((x1,y1,x2,y2), 1)                    # [bs,4,ny,nx]
+            # 中心点 + 距离，转 xyxy
+            xy = (grid + 0.5).unsqueeze(0) * stride[level]  # [1,2,ny,nx]
+            wh = distances * stride[level]                  # [bs,4,ny,nx]
+
+            # 更安全的边界框计算方式
+            x1 = (xy[:,0] - wh[:,0]).clamp(0)  # 左
+            y1 = (xy[:,1] - wh[:,2]).clamp(0)  # 上
+            x2 = (xy[:,0] + wh[:,1]).clamp(0)  # 右
+            y2 = (xy[:,1] + wh[:,3]).clamp(0)  # 下
+
+            boxes = torch.stack((x1,y1,x2,y2), 1)  # [bs,4,ny,nx]
 
             # --------- 置信度与类别 ---------
-            cls_scores, cls_idx = cls_logits.sigmoid().max(1)        # [bs,ny,nx]
+            cls_probs = cls_logits.sigmoid()             # [bs,nc,ny,nx]
+            obj_scores = cls_probs.sum(1)                # [bs,ny,nx]
+            cls_scores, cls_idx = cls_probs.max(1)       # [bs,ny,nx]
 
             # 展平为 [bs,N,6]
-            boxes   = boxes.permute(0,2,3,1).reshape(b, -1, 4)
-            scores  = cls_scores.reshape(b, -1, 1)
-            cls_idx = cls_idx.reshape(b, -1, 1).float()
+            boxes   = boxes.permute(0,2,3,1).reshape(b, -1, 4)  # [b,ny*nx,4]
+            scores  = cls_scores.reshape(b, -1, 1)              # [b,ny*nx,1]
+            obj_scores = obj_scores.reshape(b, -1, 1)           # [b,ny*nx,1]
+            cls_idx = cls_idx.reshape(b, -1, 1).float()         # [b,ny*nx,1]
+
             for i in range(bs):
-                decoded_imgs[i].append(torch.cat((boxes[i], scores[i], cls_idx[i]), 1))
+                final_scores = scores[i].clamp(0, 1.0)  # 使用cls_scores作为最终置信度
+                decoded_imgs[i].append(torch.cat((boxes[i], final_scores, cls_idx[i]), 1))
 
         # 合并三个层级
         decoded_imgs = [torch.cat(img_preds, 0) for img_preds in decoded_imgs]  # len=bs
 
         # ----------------------------------------------------
-        # 2) NMS &  指标累积
+        # 2) NMS & 指标累积
         # ----------------------------------------------------
+        n_pred_total = 0
+        n_matched_total = 0
+        
+        nms_conf_thres = conf_thres  # 0.01或更低
+
         for img_i, preds in enumerate(decoded_imgs):
-            det = non_max_suppression(preds.unsqueeze(0),        # 加 batch 维
-                                      conf_thres, iou_thres,
-                                      max_det=max_det,
-                                      nc=model.detect.nc)[0]
+            if len(preds) == 0:
+                continue
+            
+            # 确保预测框在图像范围内
+            h, w = imgs.shape[2], imgs.shape[3]
+            preds[:, 0].clamp_(0, w)  # x1
+            preds[:, 1].clamp_(0, h)  # y1
+            preds[:, 2].clamp_(0, w)  # x2
+            preds[:, 3].clamp_(0, h)  # y2
+            
+            # 只保留有效的框
+            valid_mask = (preds[:, 2] > preds[:, 0]) & (preds[:, 3] > preds[:, 1])
+            if not valid_mask.all():
+                preds = preds[valid_mask]
+            
+            # 应用NMS
+            det = non_max_suppression(preds.unsqueeze(0),
+                                   nms_conf_thres, iou_thres,
+                                   max_det=max_det,
+                                   nc=model.detect.nc)[0]
+                                   
+            n_pred_total += len(det)
 
             # confusion matrix
             gt = targets[targets[:,0] == img_i]
@@ -651,76 +797,73 @@ def validate(model, dataloader, hyp, device):
 
             # stats 用于 AP 计算
             if len(det) and len(gt):
-                # 转换格式用于计算AP
-                predn = det.clone()  # 预测结果
-                labels = gt.clone()  # 真值标签
-                nl = len(labels)     # 真值数量
-                tcls = labels[:, 1].tolist() if nl else []  # 真值类别
+                predn = det.clone()
+                labels = gt.clone()
+                nl = len(labels)
+                tcls = labels[:, 1].tolist() if nl else []
                 
-                # 计算当前图像的统计信息
                 if nl:
-                    # 计算预测框与真实框的IoU矩阵
-                    
-                    # 将归一化真实框 (xywh from labels[:, 2:6]) 转换为绝对像素坐标的 xyxy 格式
                     labels_xywh_normalized = labels[:, 2:6]
                     labels_xyxy_normalized = xywh2xyxy(labels_xywh_normalized)
                     
-                    # 获取图像的实际高和宽用于反归一化
-                    # imgs 张量的形状是 [batch_size, channels, height, width]
                     img_h, img_w = imgs.shape[2], imgs.shape[3]
                     
                     tbox = labels_xyxy_normalized.clone()
-                    tbox[:, [0, 2]] *= img_w  # x1, x2 乘以宽度
-                    tbox[:, [1, 3]] *= img_h  # y1, y2 乘以高度
+                    tbox[:, [0, 2]] *= img_w
+                    tbox[:, [1, 3]] *= img_h
                     
-                    correct = torch.zeros((len(predn), len(iouv)), dtype=torch.float32, device=device)  # 使用float32而不是bool
+                    tbox = tbox.clamp_min(0)
+                    
+                    correct = torch.zeros((len(predn), len(iouv)), dtype=torch.float32, device=device)
                     
                     if len(predn):
-                        # non_max_suppression 的输出 predn[:, :4] 已经是绝对像素坐标的 xyxy 格式
-                        pred_boxes = predn[:, :4]
+                        pred_boxes = predn[:, :4].clone()
+                        pred_boxes[:, 0].clamp_(0, img_w)
+                        pred_boxes[:, 1].clamp_(0, img_h)
+                        pred_boxes[:, 2].clamp_(0, img_w)
+                        pred_boxes[:, 3].clamp_(0, img_h)
                         
-                        pred_cls = predn[:, 5].long()  # 预测类别
-                        pred_confs = predn[:, 4]       # 预测置信度
+                        valid_mask = (pred_boxes[:, 2] > pred_boxes[:, 0]) & (pred_boxes[:, 3] > pred_boxes[:, 1])
+                        if not valid_mask.all():
+                            if valid_mask.any():
+                                pred_boxes = pred_boxes[valid_mask]
+                                predn = predn[valid_mask]
+                            else:
+                                continue
                         
-                        # 计算IoU矩阵
+                        pred_cls = predn[:, 5].long()
+                        pred_confs = predn[:, 4]
+                        
                         iou = torchvision.ops.box_iou(tbox, pred_boxes)
                         
-                        # 处理每个IoU阈值
                         for j, iou_thres_value in enumerate(iouv):
-                            # IoU大于阈值的掩码
-                            match_iou = iou >= iou_thres_value  # [num_gt, num_pred]
+                            match_iou = iou >= iou_thres_value
                             
-                            if match_iou.numel() == 0:  # 如果没有任何框
+                            if match_iou.numel() == 0:
                                 continue
                                 
-                            # 为每个真值框匹配预测框
                             for gt_idx in range(len(labels)):
                                 gt_class = int(labels[gt_idx, 1])
-                                
-                                # 找出所有与当前真值类别匹配的预测框
-                                matching_pred_mask = (pred_cls == gt_class) & match_iou[gt_idx]
+                                matching_pred_mask = match_iou[gt_idx]
                                 
                                 if matching_pred_mask.sum() > 0:
-                                    # 如果有匹配的预测框，选择IoU最高的
                                     matching_preds = torch.nonzero(matching_pred_mask).squeeze(1)
                                     iou_values = iou[gt_idx, matching_preds]
                                     best_idx = matching_preds[iou_values.argmax()]
                                     
-                                    # 标记为正确预测
-                                    if not correct[best_idx, j]:  # 避免重复计数
+                                    if not correct[best_idx, j]:
                                         correct[best_idx, j] = 1.0
+                                        n_matched_total += 1
                     
-                    # 收集统计数据(并确保都是浮点型)
-                    stats.append((correct.cpu().float(),  # correct: [num_pred, num_iou_thres]
-                                 predn[:, 4].cpu().float(),  # confidence
-                                 predn[:, 5].cpu().float(),  # predicted class
-                                 torch.tensor(tcls).float() if len(tcls) else torch.zeros(0)))  # target class
+                    stats.append((correct.cpu().float(),
+                                 predn[:, 4].cpu().float(),
+                                 predn[:, 5].cpu().float(),
+                                 torch.tensor(tcls).float() if len(tcls) else torch.zeros(0)))
 
     # ----------------------------------------------------
     # 3) 计算最终指标
     # ----------------------------------------------------
     try:
-        # 检查stats是否为空
         if not stats:
             logger.warning("没有统计数据进行评估")
             return {
@@ -731,35 +874,27 @@ def validate(model, dataloader, hyp, device):
                 "confusion_matrix": cfm.matrix.cpu().numpy()
             }
             
-        # 准备处理统计数据
         processed_stats = []
         for stat_idx, stat_type in enumerate(zip(*stats)):
-            if not stat_type:  # 如果为空
+            if not stat_type:
                 processed_stats.append(torch.zeros(0))
                 continue
                 
-            if stat_idx == 0:  # correct应该是浮点数
-                # 确保correct是浮点数类型
+            if stat_idx == 0:
                 cat_tensor = torch.cat([t.float() for t in stat_type], 0)
                 processed_stats.append(cat_tensor)
             else:
-                # 其他统计信息保持不变
                 cat_tensor = torch.cat([t if isinstance(t, torch.Tensor) else torch.tensor(t, dtype=torch.float32) for t in stat_type], 0)
                 processed_stats.append(cat_tensor)
                 
-        # 调用process函数处理统计数据
         metrics.process(*processed_stats)
         
-        # 构建结果字典
         results = {
             "metrics/precision": metrics.box.p,
             "metrics/recall": metrics.box.r,
             "metrics/mAP50": metrics.box.map50,
             "metrics/mAP50-95": metrics.box.map
         }
-        
-        # 不要调用不存在的方法
-        # results.update(metrics.class_result_dict())
         
     except Exception as e:
         logger.error(f"计算指标时出错: {str(e)}")
@@ -771,12 +906,11 @@ def validate(model, dataloader, hyp, device):
             "metrics/mAP50-95": 0.0
         }
     
-    # 添加混淆矩阵
     try:
         if isinstance(cfm.matrix, torch.Tensor):
             results["confusion_matrix"] = cfm.matrix.cpu().numpy()
         else:
-            results["confusion_matrix"] = cfm.matrix  # 已经是numpy数组
+            results["confusion_matrix"] = cfm.matrix
     except Exception as e:
         logger.warning(f"无法添加混淆矩阵：{str(e)}")
         results["confusion_matrix"] = np.zeros((model.detect.nc, model.detect.nc))
@@ -877,26 +1011,40 @@ def export_model(model, img_size, weights_path, output_path):
         # 创建示例输入
         dummy_input = torch.randn(1, 3, img_size, img_size)
         
-        # 导出ONNX - 使用更新的opset版本
-        torch.onnx.export(
-            model,
-            dummy_input,
-            output_path,
-            verbose=False,
-            opset_version=17,  # 更新到Ultralytics v8默认版本
-            input_names=['images'],
-            output_names=['output'],
-            dynamic_axes={
-                'images': {0: 'batch_size'},
-                'output': {0: 'batch_size'}
-            }
-        )
+        try:
+            # 尝试使用动态批次
+            torch.onnx.export(
+                model,
+                dummy_input,
+                output_path,
+                verbose=False,
+                opset_version=11,  # 使用更广泛兼容的版本
+                input_names=['images'],
+                output_names=['output'],
+                dynamic_axes={
+                    'images': {0: 'batch_size'},
+                    'output': {0: 'batch_size'}
+                }
+            )
+            logger.info(f"模型已导出为ONNX格式: {output_path} (opset_version=11, 动态批次)")
+        except Exception as e:
+            # 如果动态批次失败，尝试使用固定批次
+            logger.warning(f"动态批次ONNX导出失败: {e}，尝试固定批次...")
+            torch.onnx.export(
+                model,
+                dummy_input,
+                output_path,
+                verbose=False,
+                opset_version=11,
+                input_names=['images'],
+                output_names=['output']
+            )
+            logger.info(f"模型已导出为ONNX格式: {output_path} (opset_version=11, 固定批次)")
         
         # 验证ONNX模型
         onnx_model = onnx.load(output_path)
         onnx.checker.check_model(onnx_model)
         
-        logger.info(f"模型已导出为ONNX格式: {output_path} (opset_version=17)")
         return True
     except Exception as e:
         logger.error(f"导出ONNX失败: {e}")
@@ -922,13 +1070,13 @@ if __name__ == '__main__':
     # 设置日志记录级别
     # 减少日志量
     import logging
-    logging.getLogger().setLevel(logging.WARNING)
+    logging.getLogger().setLevel(logging.INFO)  # 改为INFO，确保能看到足够的信息
     
     opt = parse_args()
     
     # 只有在verbose模式下才使用详细日志
     if opt.get('verbose', False):
-        logging.getLogger().setLevel(logging.INFO)
+        logging.getLogger().setLevel(logging.DEBUG)
     
     # 设置混合精度训练
     torch.backends.cudnn.benchmark = True  # 启用cudnn基准测试以提高速度
