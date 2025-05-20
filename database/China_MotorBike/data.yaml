@@ -11,10 +11,9 @@ test_images: ./test/images  # 测试图像相对路径
 # 'D20': 2,  # 鳄鱼裂缝(Alligator Cracks)
 # 'D40': 3,  # 坑洞(Potholes)
 # 'Repair': 4,  # 修补(Repair)
-# 'Block Crack': 5  # 块状裂缝(Block Crack)
 # '''
-nc:   6  # 类别数量
-names: ['Longitudinal Cracks', 'Transverse Cracks', 'Alligator Cracks', 'Potholes', 'Repair', 'Block Crack']  # 类别名称
+nc:  5 # 类别数量
+names: ['Longitudinal Cracks', 'Transverse Cracks', 'Alligator Cracks', 'Potholes', 'Repair']  # 类别名称
 
 # 数据集配置
 channels: 3  # 图像通道数

@@ -19,6 +19,29 @@ import seaborn as sns
 from matplotlib.ticker import MaxNLocator
 from collections import Counter, defaultdict
 import matplotlib.font_manager as fm
+import math
+import logging
+import time
+
+# 配置日志
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# 创建处理器
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+# 配置根日志记录器
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(console_handler)
+
+def add_file_handler(save_dir):
+    """为日志添加文件处理器"""
+    log_file = Path(save_dir) / f"visualize_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return log_file
 
 # 配置中文字体支持
 def setup_chinese_font():
@@ -610,12 +633,37 @@ def analyze_class_distribution(dataset, class_names, save_dir):
     
     return df
 
-def visualize_dataset(data_path, num_samples=16, save_dir='debug_images'):
+def calculate_class_weights(class_frequencies):
+    """
+    计算类别权重
+    
+    参数:
+        class_frequencies: 每个类别的样本数量列表
+        
+    返回:
+        class_weights: 归一化后的类别权重列表
+    """
+    # 使用1/sqrt(freq)计算权重，平衡小类别
+    class_weights = []
+    for freq in class_frequencies:
+        if freq > 0:
+            weight = 1.0 / math.sqrt(freq)
+        else:
+            weight = 1.0  # 对于频率为0的类别，设置默认权重1.0
+        class_weights.append(weight)
+    
+    # 归一化权重
+    weight_sum = sum(class_weights)
+    class_weights = [w / weight_sum * len(class_weights) for w in class_weights]
+    
+    return class_weights
+
+def visualize_dataset(config_path='improved_yolov8/config.yaml', num_samples=16, save_dir='debug_images'):
     """
     可视化数据集中的样本
     
     参数:
-        data_path: 数据集配置文件路径
+        config_path: 配置文件路径
         num_samples: 要可视化的样本数量
         save_dir: 保存可视化结果的目录
     """
@@ -626,24 +674,86 @@ def visualize_dataset(data_path, num_samples=16, save_dir='debug_images'):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # 加载数据集配置
-    with open(data_path, 'r', encoding='utf-8') as f:
-        data_dict = yaml.safe_load(f)
+    # 添加文件日志处理器
+    log_file = add_file_handler(save_dir)
+    logger.info(f"日志文件: {log_file}")
     
-    # 获取训练集路径
-    train_path = data_dict['path'] + data_dict['train_images'].split('.')[1]
-    # 创建数据集对象
-    dataset = YOLODataset(
-        img_path=train_path,
-        data=data_dict,
-        imgsz=640,
-        augment=False,
-        cache=False
-    )
+    # 加载配置文件
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
     
-    # 获取类别名称列表
-    class_names = data_dict.get('names', [])
-    print(f"类别信息: {class_names}")  # 添加调试输出
+    # 获取数据集配置
+    data_config = config.get('data', {})
+    data_paths = data_config.get('paths', ['./database/China_MotorBike'])
+    if isinstance(data_paths, str):
+        data_paths = [data_paths]
+    
+    logger.info(f"使用数据集路径: {data_paths}")
+    
+    # 合并数据集
+    merged_train_ds = None
+    merged_val_ds = None
+    class_names = None
+    num_classes = 0
+    class_frequencies = []
+    
+    for data_path in data_paths:
+        # 加载数据集配置
+        data_yaml = os.path.join(data_path, 'data.yaml')
+        
+        # 读取配置
+        with open(data_yaml, 'r', encoding='utf-8') as f:
+            data_dict = yaml.safe_load(f)
+            
+        # 检查类别是否一致
+        if class_names is None:
+            class_names = data_dict.get('names', [])
+            num_classes = len(class_names)
+        else:
+            current_names = data_dict.get('names', [])
+            if len(current_names) != num_classes or any(a != b for a, b in zip(class_names, current_names)):
+                logger.warning(f"数据集 {data_path} 的类别与之前的数据集不一致，可能导致问题")
+        
+        # 创建数据集
+        train_path = data_dict['path'] + data_dict['train_images'].split('.')[1]
+        dataset = YOLODataset(
+            img_path=train_path,
+            data=data_dict,
+            imgsz=640,
+            augment=False,
+            cache=False
+        )
+        
+        # 统计类别频率
+        if len(class_frequencies) == 0:
+            class_frequencies = [0] * num_classes
+        
+        for label_data in dataset.labels:
+            if 'cls' in label_data:
+                cls_tensor = torch.tensor(label_data['cls']).squeeze()
+                if cls_tensor.ndim == 0:
+                    cls_tensor = cls_tensor.unsqueeze(0)
+                
+                for cls_idx in cls_tensor:
+                    class_id = cls_idx.item()
+                    if 0 <= class_id < num_classes:
+                        class_frequencies[int(class_id)] += 1
+    
+    # 计算类别权重
+    class_weights = calculate_class_weights(class_frequencies)
+    
+    # 更新配置文件
+    if 'loss' not in config:
+        config['loss'] = {}
+    config['loss']['class_weights'] = class_weights
+    
+    # 保存更新后的配置
+    with open(config_path, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, sort_keys=False)
+    
+    logger.info(f"类别频率: {class_frequencies}")
+    logger.info(f"计算得到的类别权重: {class_weights}")
+    logger.info(f"已更新配置文件: {config_path}")
     
     # ===== 添加新的统计分析 =====
     # 1. 分析边界框尺寸
@@ -692,9 +802,6 @@ def visualize_dataset(data_path, num_samples=16, save_dir='debug_images'):
         for box, cls_idx in zip(bboxes, cls):
             # 将xywh转换为xyxy格式
             x, y, w, h = box
-            # 注意：YOLODataset返回的边界框坐标已经是相对于原始图像尺寸的归一化坐标
-            # 因此需要乘以当前图像尺寸来获得像素坐标
-            # 这里的width和height是PIL图像的尺寸，可能与原始图像尺寸不同
             x_center = x * width
             y_center = y * height
             box_width = w * width
@@ -738,6 +845,8 @@ def visualize_dataset(data_path, num_samples=16, save_dir='debug_images'):
     print(f"- 总览图: {save_dir/'dataset_overview.jpg'}")
     print(f"- 单张样本: {save_dir}/sample_*.jpg")
     print(f"- 统计分析: {stats_dir}")
+    
+    return class_weights
 
 if __name__ == '__main__':
     # 设置随机种子以保证可重复性
@@ -751,11 +860,12 @@ if __name__ == '__main__':
     # 获取项目根目录
     project_root = Path(__file__).resolve().parents[2]
     
-    # 数据集配置文件路径
-    data_yaml = project_root / 'database/China_MotorBike/data.yaml'
+    # 配置文件路径
+    config_path = project_root / 'improved_yolov8/config.yaml'
     
     # 可视化保存路径
     save_dir = project_root / 'improved_yolov8/debug/visualization'
     
     # 运行可视化
-    visualize_dataset(str(data_yaml), num_samples=16, save_dir=save_dir) 
+    class_weights = visualize_dataset(str(config_path), num_samples=16, save_dir=save_dir)
+    print(f"计算得到的类别权重: {class_weights}") 

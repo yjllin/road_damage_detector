@@ -6,7 +6,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ultralytics.nn.modules import C2f, Conv, SPPF
+from ultralytics.nn.modules import C2f, Conv, SPPF, Detect
 from ultralytics.utils.tal import make_anchors
 from ultralytics.data.loaders import LoadImagesAndVideos
 import logging
@@ -21,6 +21,169 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+class DyHeadBlock(nn.Module):
+    """动态头部块 - 改进版DyHead设计
+    
+    特点:
+    1. 使用深度可分离卷积降低计算量
+    2. 添加通道注意力机制
+    3. 优化特征融合方式
+    
+    参数:
+        c (int): 输入/输出通道数
+    """
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        
+        # 空间自适应 - 使用深度可分离卷积
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c),  # 深度可分离卷积
+            nn.BatchNorm2d(c),  # 添加BN层提高稳定性
+            nn.ReLU(inplace=True)
+        )
+        
+        # 通道注意力 - 使用SE模块
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c//4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c//4, c, 1),
+            nn.Sigmoid()
+        )
+        
+        # 尺度自适应 - 多尺度特征融合
+        self.scale_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c//4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c//4, c, 1),
+            nn.Sigmoid()
+        )
+        
+        # 任务自适应 - 特征增强
+        self.task_conv = nn.Sequential(
+            nn.Conv2d(c, c, 1),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 特征融合
+        self.fusion = nn.Sequential(
+            nn.Conv2d(c*2, c, 1),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True)
+        )
+        
+        logger.info(f"初始化改进版DyHeadBlock: 通道数={c}")
+        
+    def forward(self, x):
+        """前向传播
+        
+        参数:
+            x (tensor或list): 输入特征图或特征图列表
+            
+        返回:
+            list或tensor: 处理后的特征
+        """
+        if isinstance(x, list):
+            return [self.forward_single(xi) for xi in x]
+        else:
+            return self.forward_single(x)
+            
+    def forward_single(self, x):
+        """处理单个特征图
+        
+        参数:
+            x (tensor): 输入特征图
+            
+        返回:
+            tensor: 处理后的特征图
+        """
+        # 空间特征提取
+        spatial_feat = self.spatial_conv(x)
+        
+        # 通道注意力
+        channel_att = self.channel_attention(x)
+        channel_feat = x * channel_att
+        
+        # 尺度注意力
+        scale_att = self.scale_attention(x)
+        scale_feat = x * scale_att
+        
+        # 特征融合
+        fused = torch.cat([spatial_feat, channel_feat], dim=1)
+        fused = self.fusion(fused)
+        
+        # 任务自适应处理
+        out = self.task_conv(fused)
+        
+        return out + x  # 残差连接
+
+class DyDetect(Detect):
+    """动态检测头
+    
+    基于DyHead设计的检测头，增强了特征自适应能力
+    
+    参数:
+        nc (int): 类别数
+        ch (tuple): 输入通道列表
+        reg_max (int): DFL分类器最大值
+    """
+    def __init__(self, nc, ch, reg_max=16):
+        super().__init__(nc, ch)
+        self.reg_max = reg_max
+        self.no = nc + 4 * reg_max  # 输出通道数 = nc + 4*reg_max
+        
+        # 为每个特征层级创建独立的DyHead处理模块
+        self.dyhead_modules = nn.ModuleList()
+        for c in ch:  # 对每个输入通道数分别创建处理模块
+            dyhead = nn.Sequential(
+                DyHeadBlock(c),  # 第一层DyHead
+                DyHeadBlock(c)   # 第二层DyHead
+            )
+            self.dyhead_modules.append(dyhead)
+            
+        # 回归 & 分类独立卷积
+        self.cv_reg = nn.ModuleList([nn.Conv2d(c, 4*reg_max, 1) for c in ch])
+        self.cv_cls = nn.ModuleList([nn.Conv2d(c, nc, 1) for c in ch])
+        
+        logger.info(f"初始化DyDetect: nc={nc}, reg_max={reg_max}, no={self.no}")
+
+    def _reorder(self, reg, cls):
+        """重新排列回归和分类特征，确保通道顺序与验证函数期望的一致
+        
+        参数:
+            reg (Tensor): 回归特征 [B, 4*reg_max, H, W]
+            cls (Tensor): 分类特征 [B, nc, H, W]
+            
+        返回:
+            Tensor: 按照 [B, no, H, W] 格式排列的特征图
+        """
+        return torch.cat([reg, cls], dim=1)  # 先回归后分类
+
+    def forward(self, x):
+        """前向传播
+        
+        参数:
+            x (list): 多尺度特征图列表 [p3, p4, p5]
+                
+        返回:
+            list: 多尺度检测结果列表, 每个元素形状为 [B, no, H, W]
+        """
+        # 对每个特征层级分别应用对应的DyHead处理
+        outs = []
+        for i, (feat, dyhead) in enumerate(zip(x, self.dyhead_modules)):
+            # 应用DyHead处理
+            feat = dyhead(feat)
+            
+            # 预测回归和分类
+            reg = self.cv_reg[i](feat)       # [B,4*reg_max,H,W]
+            cls = self.cv_cls[i](feat)       # [B,nc,H,W]
+            outs.append(self._reorder(reg, cls))  # 使用_reorder确保顺序一致
+            
+        return outs
 
 class EMAAttention(nn.Module):
     """指数移动平均(EMA)注意力机制
@@ -82,45 +245,165 @@ class EMAAttention(nn.Module):
         out = (ema + self.conv(x_flat)).view(B, C, H, W)
         return out + x  # 残差连接
 
-class C2f_Faster_EMA(C2f):
-    """C2f块加入EMA注意力机制
+class C2f_Faster_EMA(nn.Module):
+    """改进的C2f模块，使用EMA注意力机制
     
-    在标准C2f块基础上添加EMA注意力机制，提高特征提取能力
+    特点:
+    1. 使用EMA注意力机制增强特征提取
+    2. 优化计算效率
+    3. 添加残差连接
+    
+    参数:
+        c1 (int): 输入通道数
+        c2 (int): 输出通道数
+        n (int): 重复次数
+        shortcut (bool): 是否使用shortcut连接
     """
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        # 确保self.c的值正确设置
-        self.c = int(c2 * e)  # 中间通道数
-        self.ema = EMAAttention(self.c)
-        logger.info(f"初始化C2f_Faster_EMA: 输入通道={c1}, 输出通道={c2}, 中间通道={self.c}")
+    def __init__(self, c1, c2, n=1, shortcut=True):
+        super().__init__()
+        self.c = c2 // 2  # 通道数减半
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, 1.0, k=((1, 1), (3, 3))) for _ in range(n))
+        
+        # EMA注意力机制
+        self.ema = EMA(self.c)
         
     def forward(self, x):
-        # 标准 C2f 的前向传播逻辑
-        y = list(self.cv1(x).chunk(2, 1))  # y[0], y[1] 的通道数都是 self.c
+        """前向传播
         
-        # 应用 n 个 Bottleneck 模块，并在每个模块后应用 EMAAttention
-        for m in self.m:
-            bottleneck_out = m(y[-1])    # Bottleneck 输出通道数为 self.c
-            ema_out = self.ema(bottleneck_out) # 应用 EMA，输入/输出通道数都为 self.c
-            y.append(ema_out) # 添加经过 EMA 处理的特征
+        参数:
+            x (tensor): 输入特征图
+            
+        返回:
+            tensor: 处理后的特征图
+        """
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
         
-        # 拼接所有特征 (y[0], y[1], 和 n 个 ema_out)
-        # 总通道数为 (2 + n) * self.c
-        concatenated_features = torch.cat(y, 1)
+        # 应用EMA注意力
+        y = [self.ema(yi) for yi in y]
         
-        # 应用最终的卷积层 cv2，将通道数调整为 c2
-        return self.cv2(concatenated_features)
+        return self.cv2(torch.cat(y, 1))
 
-class SimSPPF(SPPF):
+class EMA(nn.Module):
+    """指数移动平均注意力机制
+    
+    特点:
+    1. 自适应特征增强
+    2. 降低计算复杂度
+    3. 提高特征提取效率
+    """
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # 特征融合
+        self.fc = nn.Sequential(
+            nn.Linear(c, c // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(c // 4, c),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        """前向传播
+        
+        参数:
+            x (tensor): 输入特征图
+            
+        返回:
+            tensor: 增强后的特征图
+        """
+        # 平均池化和最大池化
+        avg_out = self.avg_pool(x).view(x.size(0), -1)
+        max_out = self.max_pool(x).view(x.size(0), -1)
+        
+        # 特征融合
+        out = self.fc(avg_out + max_out)
+        out = out.view(x.size(0), x.size(1), 1, 1)
+        
+        return x * out.expand_as(x)
+
+class Bottleneck(nn.Module):
+    """改进的Bottleneck模块
+    
+    特点:
+    1. 使用深度可分离卷积
+    2. 添加BN层
+    3. 优化激活函数
+    """
+    def __init__(self, c1, c2, shortcut=True, g=1, k=((1, 1), (3, 3))):
+        super().__init__()
+        c_ = int(c2 * g)
+        self.cv1 = Conv(c1, c_, int(k[0][0]), 1)  # 确保k[0]是整数
+        self.cv2 = Conv(c_, c2, int(k[1][0]), 1, g=int(g))  # 确保k[1]和g都是整数
+        self.add = shortcut and c1 == c2
+        
+    def forward(self, x):
+        """前向传播
+        
+        参数:
+            x (tensor): 输入特征图
+            
+        返回:
+            tensor: 处理后的特征图
+        """
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class SimSPPF(nn.Module):
     """简化的空间金字塔池化模块
     
-    使用ReLU替换SiLU以提高计算效率
+    特点:
+    1. 使用ReLU替换SiLU提高计算效率
+    2. 添加注意力机制
+    3. 优化特征融合
+    
+    参数:
+        c1 (int): 输入通道数
+        c2 (int): 输出通道数
+        k (int): 池化核大小
     """
     def __init__(self, c1, c2, k=5):
-        super().__init__(c1, c2, k)
-        # 将激活函数改为ReLU提高计算效率
-        self.cv1.act = nn.ReLU()
-        self.cv2.act = nn.ReLU()
+        super().__init__()
+        c_ = c1 // 2  # 隐藏通道数
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        
+        # 注意力机制
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c_ * 4, c_ * 4 // 16, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_ * 4 // 16, c_ * 4, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        """前向传播
+        
+        参数:
+            x (tensor): 输入特征图
+            
+        返回:
+            tensor: 处理后的特征图
+        """
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        
+        # 特征拼接
+        y = torch.cat((x, y1, y2, y3), 1)
+        
+        # 应用注意力
+        att = self.attention(y)
+        y = y * att
+        
+        return self.cv2(y)
 
 class ScaleAttention(nn.Module):
     """尺度注意力机制
@@ -162,135 +445,13 @@ class ScaleAttention(nn.Module):
         att = self.fc(x)
         return x * att
 
-class DyHead(nn.Module):
-    """动态检测头
-    
-    具有尺度、空间和任务感知注意力的动态检测头
-    
-    参数:
-        c1 (int or list): 输入通道数，可以是整数（所有层相同）或列表（每层不同）
-        c2 (int): 输出通道数，通常等于类别数
-        num_classes (int): 类别数
-        anchors (list, optional): 锚点配置，如果为None则不使用锚点（anchor-free）
-        repeat (int): DyHead重复次数，默认2次
-        use_dfl (bool): 是否使用DFL，默认True
-    """
-    def __init__(self, c1, c2, num_classes=80, anchors=None, repeat=2, use_dfl=True):
-        super().__init__()
-        self.nc = num_classes  # 类别数
-        self.reg_max = 15  # 分类器的最大回归值，与v8DetectionLoss对齐
-        # self.use_dfl = use_dfl # use_dfl 不再用于决定 self.no 的计算
-
-        # 统一输出通道数计算，与 v8DetectionLoss 对齐
-        # DFL模式: nc + reg_max * 4 (xywh)
-        self.no = self.nc + 4 * self.reg_max          # 6 + 4*15 = 66
-
-        self.nl = len(c1) if isinstance(c1, list) else 3  # 检测层数
-        self.na = len(anchors[0]) // 2 if anchors else 1  # 每层锚点数
-        self.anchors = torch.tensor(anchors).float().view(self.nl, -1, 2) if anchors else None
-        self.anchor_free = anchors is None  # 标记是否为无锚点模式
-        self.repeat = repeat  # DyHead重复次数
-        
-        # YOLO风格的偏置初始化
-        pi = 0.01  # 初始目标概率
-        self._bias = -math.log((1 - pi) / pi)  # 使用YOLO的偏置初始化公式
-        
-        # 添加Ultralytics YOLO检测头所需的属性
-        self.stride = torch.tensor([8.0, 16.0, 32.0])  # 特征图步长
-        self.bbox_format = 'xywh'  # 边界框格式
-        self.nkpt = 0  # 关键点数量（如果有）
-        self.device = None  # 将在模型初始化后设置
-        
-        # args字典，包含超参数
-        self.args = {
-            'cls': 0.5,  # 分类损失权重
-            'box': 7.5,  # 边界框损失权重
-            'dfl': 1.5,  # DFL损失权重
-            'reg_max': self.reg_max,  # 分类器的最大回归值
-            'stride': self.stride.tolist(),  # 步长列表
-            'kobj': 1.0,  # 关键点目标性损失权重（如果有）
-            'fl_gamma': 0.0,  # 焦点损失gamma值
-            'anchor_t': 4.0  # 锚点阈值
-        }
-        
-        # 尺度注意力 - 为每个检测层创建独立的注意力模块
-        self.scale_att = nn.ModuleList()
-        c1_list = c1 if isinstance(c1, list) else [c1] * self.nl
-        
-        for i in range(self.nl):
-            channels = c1_list[i]
-            self.scale_att.append(ScaleAttention(channels))
-        
-        # 为每个重复级别创建卷积层
-        self.conv_layers = nn.ModuleList()
-        for r in range(self.repeat):
-            # 每个重复级别有nl个卷积层
-            conv_layer = nn.ModuleList()
-            for i in range(self.nl):
-                channels = c1_list[i]
-                # 如果不是最后一个重复层，输出通道应与输入相同
-                out_channels = self.no if r == self.repeat - 1 else channels
-                
-                # 创建卷积
-                conv = nn.Conv2d(channels, out_channels, 1)
-                
-                # 初始化卷积权重和偏置
-                if r == self.repeat - 1:  # 只为最后一层进行特殊初始化
-                    conv.bias.data.fill_(self._bias)  # 使用计算好的偏置
-                    conv.weight.data.fill_(0.01)  # 权重仍使用小值初始化
-                    
-                conv_layer.append(conv)
-            self.conv_layers.append(conv_layer)
-        
-        # 更新日志信息
-        logger.info(f"初始化DyHead: 输入通道={c1}, 类别数={num_classes}, reg_max={self.reg_max}, 输出通道={self.no} (公式: nc + 4*reg_max)")
-        
-    def forward(self, x):
-        """前向传播
-        
-        参数:
-            x (list): 特征图列表 [P3, P4, P5]，通道数分别为 [c1[0], c1[1], c1[2]]
-            
-        返回:
-            list: 检测输出列表，标准YOLOv8检测头格式 [bs, no, ny, nx]
-        """
-        z = []  # 推理输出
-        features = list(x)  # 复制输入特征，以便在迭代中修改
-        
-        # 对每个检测层进行处理
-        for i in range(self.nl):
-            feat = features[i]  # 获取特征图
-            
-            # 应用尺度注意力
-            feat = self.scale_att[i](feat)
-            
-            # 对每个重复级别应用卷积
-            for r in range(self.repeat):
-                if r < self.repeat - 1:
-                    # 中间层的输出反馈到特征图
-                    feat = self.conv_layers[r][i](feat)
-                    features[i] = feat
-                else:
-                    # 最后一层的输出用于检测
-                    final_feat = self.conv_layers[r][i](feat)
-                    
-                    # 重塑为YOLOv8标准输出格式 [bs, no, ny, nx]
-                    bs, _, ny, nx = final_feat.shape
-                    final_feat = final_feat.view(bs, self.no, ny, nx)
-                    z.append(final_feat)
-                    
-                    # 记录输出形状
-                    logger.debug(f"DyHead输出层{i}形状: {final_feat.shape}, 通道数={self.no}")
-        
-        return z
-
 class ImprovedYoloV8s(nn.Module):
     """改进的YOLOv8s模型
     
     特点:
     1. 使用C2f-Faster-EMA作为骨干网络，提高特征提取能力
     2. SimSPPF加速特征融合
-    3. DyHead动态检测头提高检测准确性
+    3. DyDetect动态检测头提高检测准确性
     
     结构与Ultralytics YOLO兼容
     """
@@ -389,15 +550,12 @@ class ImprovedYoloV8s(nn.Module):
         self.neck.append(C2f_Faster_EMA(self.ch_p4 + self.ch_p5, self.ch_p5, 2, False))  # Input: cat(256+512) = 768 -> 512
         
         # 修改p4调整卷积层的通道数
-        self.p4_adjust_conv = Conv(self.ch_p4_cat, self.ch_p4, 1, 1)  # 384→256，保持与DyHead输入一致
+        self.p4_adjust_conv = Conv(self.ch_p4_cat, self.ch_p4, 1, 1)  # 384→256，保持与DyDetect输入一致
         
-        # 检测头 - 使用DyHead，重复2次
-        self.detect = DyHead(
-            c1=[self.ch_p3, self.ch_p4, self.ch_p5],  # [128, 256, 512]
-            c2=self.num_classes,
-            num_classes=self.num_classes,
-            repeat=2,  # 重复DyHead 2次，按论文最佳点
-            use_dfl=True  # 使用DFL
+        # 检测头 - 使用DyDetect，重复2次
+        self.detect = DyDetect(
+            nc=self.num_classes,
+            ch=(self.ch_p3, self.ch_p4, self.ch_p5)
         )
         
         # 创建model属性，包含所有主要模块，与ultralytics兼容
@@ -428,7 +586,7 @@ class ImprovedYoloV8s(nn.Module):
             args['dfl'] = 1.5  # 默认dfl loss权重
             
         # 设置DFL相关参数
-        args['reg_max'] = 15  # 分类器的最大回归值，兼容DFL
+        args['reg_max'] = 16  # 分类器的最大回归值，兼容DFL
             
         self.args = args
         self.hyp = SimpleNamespace(**self.args)

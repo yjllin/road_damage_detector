@@ -1,0 +1,5 @@
+2025-05-20 14:30:51 [INFO] 日志文件: E:\A_study\sec_term_junior\robotic\road_damage_detector\improved_yolov8\debug\visualization\visualize_20250520_143051.log
+2025-05-20 14:30:51 [INFO] 使用数据集路径: ['./database/China_MotorBike', './database/United_States']
+2025-05-20 14:30:52 [INFO] 类别频率: [0, 0, 0, 0, 0]
+2025-05-20 14:30:52 [INFO] 计算得到的类别权重: [1.0, 1.0, 1.0, 1.0, 1.0]
+2025-05-20 14:30:52 [INFO] 已更新配置文件: E:\A_study\sec_term_junior\robotic\road_damage_detector\improved_yolov8\config.yaml
